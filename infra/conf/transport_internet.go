@@ -1873,7 +1873,10 @@ func (c *Xdns) Build() (proto.Message, error) {
 	}
 
 	for _, r := range c.Resolvers {
-		if !strings.Contains(r, "+udp://") {
+		if !(strings.Contains(r, "+udp://") ||
+			strings.Contains(r, "+txt://") ||
+			strings.Contains(r, "+a://") ||
+			strings.Contains(r, "+aaaa://")) {
 			return nil, errors.New("invalid resolver ", r)
 		}
 	}

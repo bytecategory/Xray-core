@@ -21,8 +21,10 @@ const (
 )
 
 var (
-	maxUDPPayload     = 1280 - 40 - 8
-	maxEncodedPayload = computeMaxEncodedPayload(maxUDPPayload)
+	maxUDPPayload         = 1280 - 40 - 8
+	maxEncodedPayloadTXT  = computeMaxEncodedPayloadForType(maxUDPPayload, RRTypeTXT)
+	maxEncodedPayloadA    = computeMaxEncodedPayloadForType(maxUDPPayload, RRTypeA)
+	maxEncodedPayloadAAAA = computeMaxEncodedPayloadForType(maxUDPPayload, RRTypeAAAA)
 )
 
 func clientIDToAddr(clientID [8]byte) *net.UDPAddr {
@@ -44,9 +46,10 @@ type record struct {
 }
 
 type queue struct {
-	last  time.Time
-	queue chan []byte
-	stash chan []byte
+	last   time.Time
+	rrType uint16
+	queue  chan []byte
+	stash  chan []byte
 }
 
 type xdnsConnServer struct {
@@ -234,6 +237,7 @@ func (c *xdnsConnServer) recvLoop() {
 func (c *xdnsConnServer) sendLoop() {
 	var nextRec *record
 	for {
+		var err error
 		rec := nextRec
 		nextRec = nil
 
@@ -246,18 +250,8 @@ func (c *xdnsConnServer) sendLoop() {
 		}
 
 		if rec.Resp.Rcode() == RcodeNoError && len(rec.Resp.Question) == 1 {
-			rec.Resp.Answer = []RR{
-				{
-					Name:  rec.Resp.Question[0].Name,
-					Type:  rec.Resp.Question[0].Type,
-					Class: rec.Resp.Question[0].Class,
-					TTL:   responseTTL,
-					Data:  nil,
-				},
-			}
-
 			var payload bytes.Buffer
-			limit := maxEncodedPayload
+			limit := maxEncodedPayloadForType(rec.Resp.Question[0].Type)
 			timer := time.NewTimer(maxResponseDelay)
 
 			for {
@@ -267,6 +261,7 @@ func (c *xdnsConnServer) sendLoop() {
 					c.mutex.Unlock()
 					return
 				}
+				q.rrType = rec.Resp.Question[0].Type
 				c.mutex.Unlock()
 
 				var p []byte
@@ -294,7 +289,11 @@ func (c *xdnsConnServer) sendLoop() {
 				}
 
 				limit -= 2 + len(p)
-				if payload.Len() > 0 && limit < 0 {
+				if limit < 0 {
+					if payload.Len() == 0 {
+						errors.LogDebug(context.Background(), rec.Addr, " ", rec.ClientAddr, " xdns payload too large for rrtype ", rec.Resp.Question[0].Type, " ", len(p))
+						continue
+					}
 					c.stash(q, p)
 					break
 				}
@@ -308,7 +307,11 @@ func (c *xdnsConnServer) sendLoop() {
 			}
 
 			timer.Stop()
-			rec.Resp.Answer[0].Data = EncodeRDataTXT(payload.Bytes())
+			rec.Resp.Answer, err = answersForPayload(rec.Resp.Question[0], responseTTL, payload.Bytes())
+			if err != nil {
+				errors.LogDebug(context.Background(), rec.Addr, " ", rec.ClientAddr, " xdns encode err ", err)
+				continue
+			}
 		}
 
 		buf, err := rec.Resp.WireFormat()
@@ -349,17 +352,20 @@ func (c *xdnsConnServer) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 }
 
 func (c *xdnsConnServer) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	if len(p)+2 > maxEncodedPayload {
-		errors.LogDebug(context.Background(), addr, " mask write err short write ", len(p), "+2 > ", maxEncodedPayload)
-		return 0, nil
-	}
-
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
 	q := c.ensureQueue(addr)
 	if q == nil {
 		return 0, io.ErrClosedPipe
+	}
+	limit := maxEncodedPayloadForType(q.rrType)
+	if q.rrType == 0 {
+		limit = maxEncodedPayloadTXT
+	}
+	if len(p)+2 > limit {
+		errors.LogDebug(context.Background(), addr, " mask write err short write ", len(p), "+2 > ", limit)
+		return 0, nil
 	}
 
 	buf := make([]byte, len(p))
@@ -473,7 +479,9 @@ func responseFor(query *Message, domains []Name) (*Message, []byte) {
 		return resp, nil
 	}
 
-	if question.Type != RRTypeTXT {
+	switch question.Type {
+	case RRTypeTXT, RRTypeA, RRTypeAAAA:
+	default:
 		resp.Flags |= RcodeNameError
 		return resp, nil
 	}
@@ -493,79 +501,4 @@ func responseFor(query *Message, domains []Name) (*Message, []byte) {
 	}
 
 	return resp, payload
-}
-
-func computeMaxEncodedPayload(limit int) int {
-	maxLengthName, err := NewName([][]byte{
-		[]byte("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
-		[]byte("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
-		[]byte("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
-		[]byte("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
-	})
-	if err != nil {
-		panic(err)
-	}
-	{
-		n := 0
-		for _, label := range maxLengthName {
-			n += len(label) + 1
-		}
-		n += 1
-		if n != 255 {
-			panic("computeMaxEncodedPayload n != 255")
-		}
-	}
-
-	queryLimit := uint16(limit)
-	if int(queryLimit) != limit {
-		queryLimit = 0xffff
-	}
-	query := &Message{
-		Question: []Question{
-			{
-				Name:  maxLengthName,
-				Type:  RRTypeTXT,
-				Class: RRTypeTXT,
-			},
-		},
-
-		Additional: []RR{
-			{
-				Name:  Name{},
-				Type:  RRTypeOPT,
-				Class: queryLimit,
-				TTL:   0,
-				Data:  []byte{},
-			},
-		},
-	}
-	resp, _ := responseFor(query, []Name{[][]byte{}})
-
-	resp.Answer = []RR{
-		{
-			Name:  query.Question[0].Name,
-			Type:  query.Question[0].Type,
-			Class: query.Question[0].Class,
-			TTL:   responseTTL,
-			Data:  nil,
-		},
-	}
-
-	low := 0
-	high := 32768
-	for low+1 < high {
-		mid := (low + high) / 2
-		resp.Answer[0].Data = EncodeRDataTXT(make([]byte, mid))
-		buf, err := resp.WireFormat()
-		if err != nil {
-			panic(err)
-		}
-		if len(buf) <= limit {
-			low = mid
-		} else {
-			high = mid
-		}
-	}
-
-	return low
 }
