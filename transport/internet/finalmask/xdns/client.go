@@ -10,7 +10,6 @@ import (
 	"io"
 	"net"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -415,32 +414,4 @@ func dnsResponsePayload(resp *Message, domains []Name) []byte {
 	}
 
 	return decodeResponsePayload(resp.Answer)
-}
-
-func parseResolver(s string) (Name, string, uint16, error) {
-	head, server, ok := strings.Cut(s, "://")
-	if !ok {
-		return nil, "", 0, errors.New("invalid resolver scheme")
-	}
-
-	domainPart, mode, ok := strings.Cut(head, "+")
-	if !ok {
-		return nil, "", 0, errors.New("invalid resolver transport")
-	}
-
-	domain, err := ParseName(domainPart)
-	if err != nil {
-		return nil, "", 0, err
-	}
-
-	switch strings.ToLower(mode) {
-	case "udp", "txt":
-		return domain, server, RRTypeTXT, nil
-	case "a":
-		return domain, server, RRTypeA, nil
-	case "aaaa":
-		return domain, server, RRTypeAAAA, nil
-	default:
-		return nil, "", 0, errors.New("unsupported resolver transport")
-	}
 }

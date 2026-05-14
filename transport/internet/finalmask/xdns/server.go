@@ -55,7 +55,7 @@ type queue struct {
 type xdnsConnServer struct {
 	net.PacketConn
 
-	domains []Name
+	domains []domainSpec
 
 	ch            chan *record
 	readQueue     chan *packet
@@ -69,9 +69,9 @@ func NewConnServer(c *Config, raw net.PacketConn) (net.PacketConn, error) {
 	if len(c.Domains) == 0 {
 		return nil, errors.New("empty domains")
 	}
-	domains := make([]Name, 0, len(c.Domains))
+	domains := make([]domainSpec, 0, len(c.Domains))
 	for _, domain := range c.Domains {
-		domain, err := ParseName(domain)
+		domain, err := parseDomainSpec(domain, "")
 		if err != nil {
 			return nil, err
 		}
@@ -412,7 +412,7 @@ func nextPacketServer(r *bytes.Reader) ([]byte, error) {
 	}
 }
 
-func responseFor(query *Message, domains []Name) (*Message, []byte) {
+func responseFor(query *Message, domains []domainSpec) (*Message, []byte) {
 	resp := &Message{
 		ID:       query.ID,
 		Flags:    0x8000,
@@ -460,11 +460,15 @@ func responseFor(query *Message, domains []Name) (*Message, []byte) {
 	}
 	question := query.Question[0]
 
-	var prefix Name
-	var ok bool
+	var (
+		prefix Name
+		ok     bool
+		match  domainSpec
+	)
 	for _, domain := range domains {
-		prefix, ok = question.Name.TrimSuffix(domain)
+		prefix, ok = question.Name.TrimSuffix(domain.name)
 		if ok {
+			match = domain
 			break
 		}
 	}
@@ -482,6 +486,10 @@ func responseFor(query *Message, domains []Name) (*Message, []byte) {
 	switch question.Type {
 	case RRTypeTXT, RRTypeA, RRTypeAAAA:
 	default:
+		resp.Flags |= RcodeNameError
+		return resp, nil
+	}
+	if match.rrType != 0 && question.Type != match.rrType {
 		resp.Flags |= RcodeNameError
 		return resp, nil
 	}

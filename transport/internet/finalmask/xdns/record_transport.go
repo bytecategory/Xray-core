@@ -198,7 +198,7 @@ func computeMaxEncodedPayloadForType(limit int, rrType uint16) int {
 			},
 		},
 	}
-	resp, _ := responseFor(query, []Name{[][]byte{}})
+	resp, _ := responseFor(query, []domainSpec{{name: Name{[]byte{}}}})
 
 	low := 0
 	high := 32768
